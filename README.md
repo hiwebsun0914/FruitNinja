@@ -1,10 +1,10 @@
 # Fruit Ninja 体感切水果
 
-基于摄像头手势识别的体感切水果小游戏，适合作为计算机视觉与交互设计课程的演示项目。
+基于摄像头手势识别的体感切水果小游戏，适合作为未来人机交互科普演示项目。
 
 ## 创作团队
 
-中山大学智能工程学院学生会 ISEGeekUp 制作团队。
+中山大学智能工程学院 ISEGeekUp 制作团队。
 
 ## 功能说明
 
@@ -30,7 +30,7 @@
 
 ## 运行参数
 
-如需调整摄像头与窗口配置，可在 `cv_fruit_ninja.py` 中修改以下常见参数（不同环境可按需调整）：
+如需调整摄像头与窗口配置，可在 `cv_fruit_ninja.py` 中修改以下常见参数：
 
 - `camera_id`：摄像头编号（默认 0）。
 - `frame_width` / `frame_height`：摄像头采集分辨率。
@@ -40,7 +40,4 @@
 
 以下为游戏运行时的部分界面截图：
 
-![主界面](release/images/home-desc.png)
-![开始游戏](release/images/new-game.png)
-![得分界面](release/images/score.png)
-![游戏结束](release/images/game-over.png)
+![主界面](release/images/demo.jpg)
