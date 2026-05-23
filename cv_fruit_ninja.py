@@ -10,17 +10,27 @@ Then open http://localhost:FN_PORT (default 8888)
 import math
 import os
 import random
+import subprocess
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import cv2
+from google.protobuf import message_factory as protobuf_message_factory
 import mediapipe as mp
 import numpy as np
-from flask import Flask, Response, jsonify, send_file
+from flask import Flask, Response, jsonify, request, send_file
+
+
+if not hasattr(protobuf_message_factory, "GetMessageClass"):
+    def _compat_get_message_class(descriptor):
+        factory = protobuf_message_factory.MessageFactory()
+        return factory.GetPrototype(descriptor)
+
+    protobuf_message_factory.GetMessageClass = _compat_get_message_class
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "source" / "images"
@@ -42,6 +52,7 @@ STREAM_FPS = float(os.environ.get("FN_STREAM_FPS", 30))
 HOST = os.environ.get("FN_HOST", "0.0.0.0")
 PORT = int(os.environ.get("FN_PORT", 8888))
 CAMERA_STREAM_URL = os.environ.get("FN_CAMERA_STREAM_URL", "local").strip()
+CAMERA_SCAN_LIMIT = max(2, int(os.environ.get("FN_CAMERA_SCAN_LIMIT", 6)))
 
 FRUIT_FILES = {
     "peach": ("fruit/peach.png", "#e6c731"),
@@ -221,6 +232,42 @@ INDEX_HTML = """<!doctype html>
       text-transform: uppercase;
       color: var(--accent-cool);
     }
+    .camera-toolbar {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .camera-select {
+      flex: 1 1 240px;
+      min-width: 220px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(0, 0, 0, 0.1);
+      background: rgba(255, 255, 255, 0.9);
+      color: var(--ink);
+      font: inherit;
+    }
+    .camera-button {
+      border: 0;
+      border-radius: 14px;
+      padding: 12px 18px;
+      background: var(--accent);
+      color: white;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 12px 24px rgba(225, 108, 47, 0.25);
+    }
+    .camera-button:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+    .camera-hint {
+      color: var(--muted);
+      font-size: 0.92rem;
+      min-height: 1.4em;
+    }
     .metrics {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -304,6 +351,21 @@ INDEX_HTML = """<!doctype html>
     </section>
 
     <section class="panel-grid">
+      <div class="panel reveal" style="--delay: 0.2s">
+        <h3>Camera Source</h3>
+        <div class="camera-toolbar">
+          <select id="camera-select" class="camera-select">
+            <option value="">正在扫描摄像头...</option>
+          </select>
+          <button id="camera-apply" class="camera-button" type="button">切换到该摄像头</button>
+        </div>
+        <div class="camera-hint" id="camera-hint">优先选择你的外接摄像头，例如 Logi C270 HD WebCam。</div>
+        <div class="metrics">
+          <div class="metric"><span class="label">当前设备</span><span class="value" id="active-camera">--</span></div>
+          <div class="metric"><span class="label">输入源</span><span class="value" id="stream-source">--</span></div>
+        </div>
+      </div>
+
       <div class="panel reveal" style="--delay: 0.25s">
         <h3>Scoreboard</h3>
         <div class="metrics">
@@ -348,8 +410,14 @@ INDEX_HTML = """<!doctype html>
       minPersonRatio: document.getElementById("min-person-ratio"),
       detectionConf: document.getElementById("detection-conf"),
       trackingConf: document.getElementById("tracking-conf"),
-      lastEvent: document.getElementById("last-event")
+      lastEvent: document.getElementById("last-event"),
+      activeCamera: document.getElementById("active-camera"),
+      streamSource: document.getElementById("stream-source")
     };
+    const streamEl = document.getElementById("stream");
+    const cameraSelect = document.getElementById("camera-select");
+    const cameraApply = document.getElementById("camera-apply");
+    const cameraHint = document.getElementById("camera-hint");
 
     const formatNumber = (value, digits = 1) => {
       if (value === null || value === undefined || Number.isNaN(value)) {
@@ -367,6 +435,93 @@ INDEX_HTML = """<!doctype html>
         return;
       }
       el.textContent = value;
+    };
+
+    const resetStream = () => {
+      if (!streamEl) {
+        return;
+      }
+      streamEl.src = `/stream?t=${Date.now()}`;
+    };
+
+    const setCameraHint = (message) => {
+      if (cameraHint) {
+        cameraHint.textContent = message;
+      }
+    };
+
+    const renderCameraOptions = (payload) => {
+      if (!cameraSelect) {
+        return;
+      }
+      const cameras = Array.isArray(payload?.cameras) ? payload.cameras : [];
+      const activeIndex = payload?.active_camera_index;
+      cameraSelect.innerHTML = "";
+      if (!cameras.length) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "未找到可用摄像头";
+        cameraSelect.appendChild(option);
+        cameraSelect.disabled = true;
+        if (cameraApply) {
+          cameraApply.disabled = true;
+        }
+        return;
+      }
+      cameraSelect.disabled = false;
+      if (cameraApply) {
+        cameraApply.disabled = false;
+      }
+      cameras.forEach((camera) => {
+        const option = document.createElement("option");
+        option.value = String(camera.index);
+        option.textContent = `${camera.name} · 索引 ${camera.index} · ${camera.backend} · ${camera.frame_size}`;
+        if (camera.index === activeIndex) {
+          option.selected = true;
+        }
+        cameraSelect.appendChild(option);
+      });
+    };
+
+    const loadCameras = async () => {
+      try {
+        const response = await fetch("/cameras", { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error("camera fetch failed");
+        }
+        const payload = await response.json();
+        renderCameraOptions(payload);
+      } catch (error) {
+        setCameraHint("摄像头列表读取失败，请确认服务仍在运行。");
+      }
+    };
+
+    const applyCameraSelection = async () => {
+      if (!cameraSelect || !cameraApply) {
+        return;
+      }
+      const selected = cameraSelect.value;
+      cameraApply.disabled = true;
+      setCameraHint("正在切换摄像头，请稍候...");
+      try {
+        const response = await fetch("/camera/select", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ index: selected })
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.message || "camera switch failed");
+        }
+        setCameraHint(payload.message || "摄像头切换成功。");
+        renderCameraOptions(payload);
+        resetStream();
+        await refreshStats();
+      } catch (error) {
+        setCameraHint(`切换失败：${error.message}`);
+      } finally {
+        cameraApply.disabled = false;
+      }
     };
 
     const updateStatus = (status) => {
@@ -399,14 +554,25 @@ INDEX_HTML = """<!doctype html>
         setText(fields.minPersonRatio, formatNumber(data.min_person_ratio, 3));
         setText(fields.detectionConf, formatNumber(data.detection_conf, 2));
         setText(fields.trackingConf, formatNumber(data.tracking_conf, 2));
+        const cameraLabel = data.active_camera_backend
+          ? `${data.active_camera_name ?? "--"} · ${data.active_camera_backend}`
+          : (data.active_camera_name ?? "--");
+        setText(fields.activeCamera, cameraLabel);
+        setText(fields.streamSource, data.stream_source ?? "--");
         updateStatus(data.status ?? "running");
       } catch (error) {
         updateStatus("camera_error");
       }
     };
 
+    if (cameraApply) {
+      cameraApply.addEventListener("click", applyCameraSelection);
+    }
+
+    loadCameras();
     refreshStats();
     setInterval(refreshStats, 250);
+    setInterval(loadCameras, 5000);
   </script>
 </body>
 </html>
@@ -419,14 +585,145 @@ class StreamState:
     stats: Dict[str, object] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
     started: bool = False
+    active_camera_index: Optional[int] = None
+    active_camera_name: str = "Auto"
+    active_camera_backend: str = "Auto"
+    stream_source: str = CAMERA_STREAM_URL if CAMERA_STREAM_URL else "local"
+    available_cameras: List[Dict[str, object]] = field(default_factory=list)
 
 
 STATE = StreamState()
 STOP_EVENT = threading.Event()
+CAMERA_SWITCH_EVENT = threading.Event()
 
 
 def debug(msg: str) -> None:
     print(f"[DEBUG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def list_windows_camera_names() -> List[str]:
+    command = (
+        "Get-PnpDevice -Class Camera | "
+        "Where-Object { $_.Status -eq 'OK' } | "
+        "Select-Object -ExpandProperty FriendlyName"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=8,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+    names = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    return names
+
+
+def detect_available_cameras(scan_limit: int = CAMERA_SCAN_LIMIT) -> List[Dict[str, object]]:
+    names = list_windows_camera_names()
+    backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    cameras: List[Dict[str, object]] = []
+    for idx in range(scan_limit):
+        detected_backend = None
+        frame_size = None
+        for backend in backends:
+            cap = cv2.VideoCapture(idx, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            ret, frame = cap.read()
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            cap.release()
+            if not ret or frame is None:
+                continue
+            if width <= 0 or height <= 0:
+                height, width = frame.shape[:2]
+            detected_backend = backend_label(backend)
+            frame_size = f"{width}x{height}"
+            break
+        if detected_backend is None:
+            continue
+        cameras.append(
+            {
+                "index": idx,
+                "name": names[idx] if idx < len(names) else f"Camera {idx}",
+                "backend": detected_backend,
+                "frame_size": frame_size or "unknown",
+            }
+        )
+    return cameras
+
+
+def refresh_available_cameras() -> List[Dict[str, object]]:
+    cameras = detect_available_cameras()
+    with STATE.lock:
+        STATE.available_cameras = cameras
+    return cameras
+
+
+def backend_code_from_label(label: Optional[str]) -> Optional[int]:
+    name_map = {
+        "CAP_ANY": cv2.CAP_ANY,
+        "CAP_DSHOW": cv2.CAP_DSHOW,
+        "CAP_MSMF": cv2.CAP_MSMF,
+    }
+    return name_map.get(label or "")
+
+
+def set_active_camera_state(index: Optional[int], name: str, source: str, backend: str = "Auto") -> None:
+    with STATE.lock:
+        STATE.active_camera_index = index
+        STATE.active_camera_name = name
+        STATE.active_camera_backend = backend
+        STATE.stream_source = source
+
+
+def get_camera_name(index: Optional[int]) -> str:
+    if index is None:
+        return "Auto"
+    with STATE.lock:
+        cameras = list(STATE.available_cameras)
+    for camera in cameras:
+        if camera.get("index") == index:
+            return str(camera.get("name"))
+    return f"Camera {index}"
+
+
+def request_camera_switch(index: Optional[int]) -> Dict[str, object]:
+    with STATE.lock:
+        cameras = list(STATE.available_cameras)
+    if not cameras:
+        cameras = refresh_available_cameras()
+    available_indices = {camera["index"] for camera in cameras}
+    if index is not None and index not in available_indices:
+        return {
+            "ok": False,
+            "message": f"Camera index {index} is not available.",
+            "available_cameras": cameras,
+        }
+    camera_name = "Auto"
+    camera_backend = "Auto"
+    if index is not None:
+        for camera in cameras:
+            if camera.get("index") == index:
+                camera_name = str(camera.get("name"))
+                camera_backend = str(camera.get("backend", "Auto"))
+                break
+        else:
+            camera_name = f"Camera {index}"
+    set_active_camera_state(index, camera_name, "local", camera_backend)
+    CAMERA_SWITCH_EVENT.set()
+    return {
+        "ok": True,
+        "message": f"Switching to {camera_name}.",
+        "active_camera_index": index,
+        "available_cameras": cameras,
+    }
 
 
 def backend_label(backend: int) -> str:
@@ -765,7 +1062,7 @@ def get_wrist_positions(results, frame_shape):
     return wrists
 
 
-def open_camera(preferred_index: Optional[int] = None) -> Optional[cv2.VideoCapture]:
+def open_camera(preferred_index: Optional[int] = None, preferred_backend: Optional[int] = None) -> Optional[cv2.VideoCapture]:
     """Try multiple backends/indices and emit debug info."""
     stream_url = CAMERA_STREAM_URL
     if stream_url and stream_url.lower() not in {"0", "false", "none", "local"}:
@@ -788,8 +1085,11 @@ def open_camera(preferred_index: Optional[int] = None) -> Optional[cv2.VideoCapt
         name_map = {"ANY": cv2.CAP_ANY, "DSHOW": cv2.CAP_DSHOW, "MSMF": cv2.CAP_MSMF}
         backends = [name_map[b.strip().upper()] for b in env_backends.split(",") if b.strip().upper() in name_map]
     else:
-        backends = [cv2.CAP_ANY, cv2.CAP_DSHOW]
-    indices = [1, 0, 2, 3]
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    if preferred_backend is not None:
+        backends = [preferred_backend] + [backend for backend in backends if backend != preferred_backend]
+        debug(f"Trying preferred backend {backend_label(preferred_backend)} first.")
+    indices = list(range(CAMERA_SCAN_LIMIT))
     if preferred_index is not None:
         indices = [preferred_index] + [i for i in indices if i != preferred_index]
         debug(f"Trying preferred camera index {preferred_index} first.")
@@ -833,6 +1133,11 @@ def build_stats(game: Game, fps: float, frame_shape, pose_visible: bool, now: fl
     event = game.last_event
     if now - game.last_event_time > 2.5:
         event = "steady"
+    with STATE.lock:
+        active_camera_index = STATE.active_camera_index
+        active_camera_name = STATE.active_camera_name
+        active_camera_backend = STATE.active_camera_backend
+        stream_source = STATE.stream_source
     return {
         "status": status,
         "score": game.score,
@@ -849,19 +1154,38 @@ def build_stats(game: Game, fps: float, frame_shape, pose_visible: bool, now: fl
         "detection_conf": POSE_DETECTION_CONF,
         "tracking_conf": POSE_TRACKING_CONF,
         "last_event": event,
+        "active_camera_index": active_camera_index,
+        "active_camera_name": active_camera_name,
+        "active_camera_backend": active_camera_backend,
+        "stream_source": stream_source,
     }
 
 
 def capture_loop() -> None:
     game = Game()
-    preferred_idx = os.environ.get("FN_CAMERA_INDEX", "1")
+    preferred_idx = os.environ.get("FN_CAMERA_INDEX")
     preferred_idx_val = None
+    preferred_backend_val = None
+    preferred_backend_name = "Auto"
     if preferred_idx:
         try:
             preferred_idx_val = int(preferred_idx)
         except ValueError:
             debug(f"Ignoring FN_CAMERA_INDEX='{preferred_idx}' (not an int).")
-    cap = open_camera(preferred_idx_val)
+    cameras = refresh_available_cameras()
+    if preferred_idx_val is None and CAMERA_STREAM_URL.lower() in {"0", "false", "none", "local"} and cameras:
+        preferred_idx_val = int(cameras[0]["index"])
+    selected_camera = next((camera for camera in cameras if camera.get("index") == preferred_idx_val), None)
+    if selected_camera is not None:
+        preferred_backend_name = str(selected_camera.get("backend", "Auto"))
+        preferred_backend_val = backend_code_from_label(preferred_backend_name)
+    set_active_camera_state(
+        preferred_idx_val,
+        get_camera_name(preferred_idx_val),
+        "local" if CAMERA_STREAM_URL.lower() in {"0", "false", "none", "local"} else CAMERA_STREAM_URL,
+        preferred_backend_name,
+    )
+    cap = open_camera(preferred_idx_val, preferred_backend_val)
     if cap is None:
         error_frame = build_error_frame("No camera available.")
         encoded = encode_frame(error_frame)
@@ -884,6 +1208,10 @@ def capture_loop() -> None:
                     "detection_conf": POSE_DETECTION_CONF,
                     "tracking_conf": POSE_TRACKING_CONF,
                     "last_event": "camera_error",
+                    "active_camera_index": preferred_idx_val,
+                    "active_camera_name": get_camera_name(preferred_idx_val),
+                    "active_camera_backend": preferred_backend_name,
+                    "stream_source": STATE.stream_source,
                 }
         return
 
@@ -892,6 +1220,46 @@ def capture_loop() -> None:
 
     try:
         while not STOP_EVENT.is_set():
+            if CAMERA_SWITCH_EVENT.is_set():
+                CAMERA_SWITCH_EVENT.clear()
+                with STATE.lock:
+                    next_camera_index = STATE.active_camera_index
+                    next_camera_backend_name = STATE.active_camera_backend
+                    STATE.frame = None
+                debug(f"Switching camera to index {next_camera_index}.")
+                cap.release()
+                cap = open_camera(next_camera_index, backend_code_from_label(next_camera_backend_name))
+                if cap is None:
+                    error_frame = build_error_frame("Selected camera unavailable.")
+                    encoded = encode_frame(error_frame)
+                    if encoded:
+                        with STATE.lock:
+                            STATE.frame = encoded
+                            STATE.stats = {
+                                "status": "camera_error",
+                                "score": game.score,
+                                "lives": game.lives,
+                                "fruits": len(game.fruits),
+                                "fps": 0,
+                                "wrist_speed": round(game.last_speed, 0),
+                                "pose_visible": False,
+                                "frame_size": f"{WIDTH}x{HEIGHT}",
+                                "spawn_interval": SPAWN_INTERVAL,
+                                "gravity": GRAVITY,
+                                "blade_threshold": BLADE_SPEED_THRESHOLD,
+                                "min_person_ratio": MIN_PERSON_RATIO,
+                                "detection_conf": POSE_DETECTION_CONF,
+                                "tracking_conf": POSE_TRACKING_CONF,
+                                "last_event": "camera_error",
+                                "active_camera_index": next_camera_index,
+                                "active_camera_name": get_camera_name(next_camera_index),
+                                "active_camera_backend": next_camera_backend_name,
+                                "stream_source": "local",
+                            }
+                    time.sleep(0.2)
+                    continue
+                last_frame_time = time.time()
+                fps = 0.0
             ret, frame = cap.read()
             if not ret:
                 time.sleep(0.02)
@@ -973,6 +1341,32 @@ def stats():
     with STATE.lock:
         payload = dict(STATE.stats) if STATE.stats else {"status": "starting"}
     return jsonify(payload)
+
+
+@app.get("/cameras")
+def cameras():
+    with STATE.lock:
+        payload = list(STATE.available_cameras)
+        active_camera_index = STATE.active_camera_index
+    if not payload:
+        payload = refresh_available_cameras()
+    return jsonify({"cameras": payload, "active_camera_index": active_camera_index})
+
+
+@app.post("/camera/select")
+def select_camera():
+    payload = request.get_json(silent=True) or {}
+    raw_index = payload.get("index")
+    if raw_index in ("", "auto", None):
+        index = None
+    else:
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "message": "Camera index must be an integer."}), 400
+    result = request_camera_switch(index)
+    status_code = 200 if result.get("ok") else 400
+    return jsonify(result), status_code
 
 
 @app.get("/logo.png")

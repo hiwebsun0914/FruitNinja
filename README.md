@@ -1,43 +1,60 @@
-# Fruit Ninja 体感切水果
+# Fruit Ninja 体感版
 
-基于摄像头手势识别的体感切水果小游戏，适合作为未来人机交互科普演示项目。
+基于摄像头姿态识别的网页水果忍者演示项目。程序会启动一个本地 Web 服务，在浏览器中显示实时视频、骨骼识别结果和游戏画面。
 
-## 创作团队
+## 当前运行方式
 
-中山大学智能工程学院 ISEGeekUp 制作团队。
+项目当前建议使用 `conda` 环境 `pytorch_gpu_23.5.30` 运行：
 
-## 功能说明
+```powershell
+conda run -n pytorch_gpu_23.5.30 python cv_fruit_ninja.py
+```
 
-- **体感切水果**：使用摄像头检测手部动作，实现挥动切割水果的交互体验。
-- **计分与结算**：切中水果会计分，游戏结束时展示结算界面。
-- **界面与特效**：包含主界面、开始界面、分数展示与结算界面。
+启动后打开：
 
-## 运行方式
+```text
+http://127.0.0.1:8888/
+```
 
-> 运行前请确保已连接摄像头并安装 Python 3。建议在 Windows 上运行。
+## 前端摄像头切换
 
-1. 安装依赖（如未安装 OpenCV）：
+页面中新增了 `Camera Source` 面板，可以直接在前端选择摄像头并切换，无需手动改代码。
 
-   ```bash
-   pip install opencv-python
-   ```
+- `Logi C270 HD WebCam`：当前识别到的外接摄像头
+- `HD Webcam`：通常是笔记本内置摄像头
 
-2. 启动游戏：
+如果你希望默认优先使用某个摄像头，也可以在启动前设置环境变量：
 
-   ```bash
-   python cv_fruit_ninja.py
-   ```
+```powershell
+$env:FN_CAMERA_INDEX='0'
+conda run -n pytorch_gpu_23.5.30 python cv_fruit_ninja.py
+```
 
-## 运行参数
+## 常用环境变量
 
-如需调整摄像头与窗口配置，可在 `cv_fruit_ninja.py` 中修改以下常见参数：
+- `FN_PORT`：服务端口，默认 `8888`
+- `FN_CAMERA_INDEX`：优先尝试的摄像头索引
+- `FN_CAMERA_BACKENDS`：摄像头后端顺序，例如 `DSHOW,MSMF`
+- `FN_WIDTH` / `FN_HEIGHT`：采集分辨率
+- `FN_DISPLAY_SCALE`：前端显示缩放比例
 
-- `camera_id`：摄像头编号（默认 0）。
-- `frame_width` / `frame_height`：摄像头采集分辨率。
-- `window_name`：窗口标题。
+## 依赖
 
-## 运行截图
+项目依赖主要包括：
 
-以下为游戏运行时的部分界面截图：
+- `opencv-python`
+- `mediapipe`
+- `numpy`
+- `flask`
 
-![主界面](release/images/demo.jpg)
+如果你在新的环境中运行，可以按需安装：
+
+```powershell
+pip install opencv-python mediapipe numpy flask
+```
+
+## 说明
+
+- 建议在 Windows 下运行
+- 首次启动时会扫描可用摄像头
+- 如果页面能打开但没有体感效果，先确认人物已经进入镜头且姿态被识别到
